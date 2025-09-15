@@ -56,10 +56,12 @@ class ScreenRecordService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_PREPARE -> {
-                // 준비 상태로 서비스를 시작 (실제 녹화는 시작하지 않음)
+                // ▼▼▼▼▼ [수정됨] ▼▼▼▼▼
+                // '준비' 단계에서만 mediaProjection 객체를 생성합니다.
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
                 val data = intent.getParcelableExtra<Intent>(EXTRA_DATA)
-                if (data != null) {
+
+                if (data != null && mediaProjection == null) { // mediaProjection이 없을 때만 생성
                     startForegroundWithNotification()
                     mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
                     mediaProjection?.registerCallback(object : MediaProjection.Callback() {
@@ -68,27 +70,21 @@ class ScreenRecordService : Service() {
                         }
                     }, Handler(Looper.getMainLooper()))
                     // 준비만 하고 대기 상태
-                } else {
+                } else if (data == null) {
                     stopSelf()
                 }
             }
             ACTION_START -> {
-                if (!isRecording) {
-                    val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
-                    val data = intent.getParcelableExtra<Intent>(EXTRA_DATA)
-                    if (data != null) {
-                        isRecording = true
-                        startForegroundWithNotification()
-                        mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
-                        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-                            override fun onStop() {
-                                if (isRecording) stopRecording()
-                            }
-                        }, Handler(Looper.getMainLooper()))
-                        Thread { startRecording() }.start()
-                    } else {
-                        stopSelf()
-                    }
+                // ▼▼▼▼▼ [수정됨] ▼▼▼▼▼
+                // '시작' 단계에서는 이미 만들어진 mediaProjection 객체를 사용하기만 합니다.
+                // 더 이상 resultCode와 data를 여기서 받지 않습니다.
+                if (!isRecording && mediaProjection != null) { // mediaProjection 객체가 있는지 확인
+                    isRecording = true
+                    // 별도의 스레드에서 녹화 시작
+                    Thread { startRecording() }.start()
+                } else if (mediaProjection == null) {
+                    // 준비가 안 된 상태이므로 서비스 종료
+                    stopSelf()
                 }
             }
             ACTION_STOP -> {
