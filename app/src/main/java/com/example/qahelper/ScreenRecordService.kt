@@ -1,47 +1,52 @@
 package com.example.qahelper
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.Service
+import android.annotation.SuppressLint
+import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.AudioAttributes
-import android.media.AudioPlaybackCaptureConfiguration
-import android.media.MediaRecorder
+import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Build
-import android.os.Environment
-import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
+import android.os.*
 import androidx.core.app.NotificationCompat
-import java.io.IOException
+import androidx.core.content.ContextCompat
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
-import kotlin.concurrent.thread
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ScreenRecordService : Service() {
 
     private lateinit var mediaProjectionManager: MediaProjectionManager
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private lateinit var mediaRecorder: MediaRecorder
 
-    private var screenDensity: Int = 0
-    private var displayWidth: Int = 1920
-    private var displayHeight: Int = 1080
+    private var videoEncoder: MediaCodec? = null
+    private var audioEncoder: MediaCodec? = null
+    private var mediaMuxer: MediaMuxer? = null
+    private var audioRecord: AudioRecord? = null
 
-    private val mediaProjectionCallback = object : MediaProjection.Callback() {
-        override fun onStop() {
-            super.onStop()
-            stopRecording()
-            stopSelf()
-        }
+    private var audioRecordThread: Thread? = null
+    private var videoDrainThread: Thread? = null
+    private var audioDrainThread: Thread? = null
+
+
+    @Volatile
+    private var isRecording = false
+    private val muxerStarted = AtomicBoolean(false)
+    private var videoTrackIndex = -1
+    private var audioTrackIndex = -1
+
+    private val screenDensity by lazy { resources.displayMetrics.densityDpi }
+    private val screenWidth by lazy { resources.displayMetrics.widthPixels }
+    private val screenHeight by lazy { resources.displayMetrics.heightPixels }
+    private val isAudioPermissionGranted by lazy {
+        ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
     }
+    private val muxerLock = java.lang.Object()
 
     override fun onCreate() {
         super.onCreate()
@@ -49,158 +54,299 @@ class ScreenRecordService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        createNotificationChannel()
-        startForeground(NOTIFICATION_ID, createNotification())
-
-        thread {
-            startRecording(intent)
-        }
-
-        return START_STICKY
-    }
-
-    private fun startRecording(intent: Intent?) {
-        intent?.let {
-            val resultCode = it.getIntExtra("resultCode", -1)
-            val data: Intent? = it.getParcelableExtra("data")
-
-            if (data != null) {
-                mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
-                mediaProjection?.registerCallback(mediaProjectionCallback, Handler(Looper.getMainLooper()))
-
-                val metrics = resources.displayMetrics
-                screenDensity = metrics.densityDpi
-                displayWidth = metrics.widthPixels
-                displayHeight = metrics.heightPixels
-
-                // 1. MediaRecorder를 먼저 초기화합니다. (구조 수정)
-                initRecorder()
-
-                // 2. 안드로이드 10 이상에서만 mediaProjection을 이용해 내부 오디오 캡처를 설정합니다. (구조 수정)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
-                        .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                        .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                        .build()
-                    mediaRecorder.setAudioPlaybackCaptureConfig(config)
-                }
-
-                createVirtualDisplay()
-
-                try {
-                    mediaRecorder.start()
-                } catch (e: IllegalStateException) {
-                    e.printStackTrace()
+        when (intent?.action) {
+            ACTION_PREPARE -> {
+                // 준비 상태로 서비스를 시작 (실제 녹화는 시작하지 않음)
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
+                val data = intent.getParcelableExtra<Intent>(EXTRA_DATA)
+                if (data != null) {
+                    startForegroundWithNotification()
+                    mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
+                    mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                        override fun onStop() {
+                            if (isRecording) stopRecording()
+                        }
+                    }, Handler(Looper.getMainLooper()))
+                    // 준비만 하고 대기 상태
+                } else {
                     stopSelf()
                 }
-            } else {
-                stopSelf()
             }
-        } ?: stopSelf()
-    }
-
-    private fun initRecorder() {
-        // minSdk가 29이므로 버전 체크를 단순화하거나 제거할 수 있습니다.
-        // 현재 코드는 하위 호환성을 위해 남겨둡니다.
-        mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            MediaRecorder(this)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaRecorder()
-        }
-
-        val videoPath = generateFilePath()
-        mediaRecorder.apply {
-            setVideoSource(MediaRecorder.VideoSource.SURFACE)
-
-            // minSdk가 29이므로 사실상 이 코드만 실행됩니다.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // 'PLAYBACK'이 아닌 'VOICE_UPLINK'가 올바른 오디오 소스입니다. (오류 수정)
-                setAudioSource(MediaRecorder.AudioSource.VOICE_UPLINK)
+            ACTION_START -> {
+                if (!isRecording) {
+                    val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
+                    val data = intent.getParcelableExtra<Intent>(EXTRA_DATA)
+                    if (data != null) {
+                        isRecording = true
+                        startForegroundWithNotification()
+                        mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
+                        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                            override fun onStop() {
+                                if (isRecording) stopRecording()
+                            }
+                        }, Handler(Looper.getMainLooper()))
+                        Thread { startRecording() }.start()
+                    } else {
+                        stopSelf()
+                    }
+                }
             }
-
-            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            setOutputFile(videoPath)
-            setVideoSize(displayWidth, displayHeight)
-            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            }
-
-            setVideoEncodingBitRate(8 * 1024 * 1024)
-            setVideoFrameRate(30)
-            try {
-                prepare()
-            } catch (e: IOException) {
-                e.printStackTrace()
+            ACTION_STOP -> {
+                if (isRecording) stopRecording()
             }
         }
+        return START_NOT_STICKY
     }
 
-    private fun generateFilePath(): String {
-        val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
-        val sdf = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault())
-        return "${directory.absolutePath}/record_${sdf.format(Date())}.mp4"
-    }
-
-    private fun createVirtualDisplay() {
-        virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "ScreenRecordService",
-            displayWidth,
-            displayHeight,
-            screenDensity,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            mediaRecorder.surface,
-            null,
-            null
-        )
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        stopRecording()
-    }
-
-    private fun stopRecording() {
+    private fun startRecording() {
         try {
-            mediaProjection?.unregisterCallback(mediaProjectionCallback)
-            mediaRecorder.stop()
-            mediaRecorder.reset()
-            mediaRecorder.release()
-            virtualDisplay?.release()
-            mediaProjection?.stop()
+            setupMuxer()
+            setupVideoEncoder()
+            if (isAudioPermissionGranted) {
+                setupAudioComponents()
+            }
+
+            videoDrainThread = Thread { drainEncoder(videoEncoder, false) }.apply { start() }
+            if (isAudioPermissionGranted && audioEncoder != null) {
+                audioDrainThread = Thread { drainEncoder(audioEncoder, true) }.apply { start() }
+            }
         } catch (e: Exception) {
             e.printStackTrace()
+            releaseResources()
         }
     }
 
-    private fun createNotification(): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+    private fun setupMuxer() {
+        val outputPath = generateFilePath("record.mp4")
+        mediaMuxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    }
+
+    private fun setupVideoEncoder() {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, screenWidth, screenHeight).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, 8 * 1024 * 1024)
+            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+        videoEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            virtualDisplay = mediaProjection?.createVirtualDisplay(
+                "ScreenRecordService", screenWidth, screenHeight, screenDensity,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, createInputSurface(), null, null
+            )
+            start()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun setupAudioComponents() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        try {
+            val audioFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 44100, 2).apply {
+                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                setInteger(MediaFormat.KEY_BIT_RATE, 192000)
+            }
+            audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
+                configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                start()
+            }
+
+            val audioPlaybackConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .build()
+
+            val audioRecordFormat = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(44100)
+                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                .build()
+            val minBufferSize = AudioRecord.getMinBufferSize(audioRecordFormat.sampleRate, audioRecordFormat.channelMask, audioRecordFormat.encoding)
+
+            audioRecord = AudioRecord.Builder()
+                .setAudioFormat(audioRecordFormat)
+                .setBufferSizeInBytes(minBufferSize * 2)
+                .setAudioPlaybackCaptureConfig(audioPlaybackConfig)
+                .build().also {
+                    if (it.state != AudioRecord.STATE_INITIALIZED) {
+                        it.release(); throw IllegalStateException("AudioRecord 초기화 실패")
+                    }
+                    it.startRecording()
+                }
+
+            audioRecordThread = Thread {
+                val buffer = ByteArray(4096)
+                while (isRecording) {
+                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: -1
+                    if (read > 0) feedAudioEncoder(buffer, read)
+                }
+            }
+            audioRecordThread?.start()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            audioEncoder?.release(); audioEncoder = null
+        }
+    }
+
+    private fun feedAudioEncoder(data: ByteArray, length: Int) {
+        if (!isRecording) return
+        try {
+            audioEncoder?.let { encoder ->
+                val inputBufferIndex = encoder.dequeueInputBuffer(10000)
+                if (inputBufferIndex >= 0) {
+                    encoder.getInputBuffer(inputBufferIndex)?.apply {
+                        clear()
+                        put(data, 0, length)
+                        encoder.queueInputBuffer(inputBufferIndex, 0, length, System.nanoTime() / 1000, 0)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // 무시
+        }
+    }
+
+    private fun drainEncoder(encoder: MediaCodec?, isAudio: Boolean) {
+        if (encoder == null) return
+        val bufferInfo = MediaCodec.BufferInfo()
+        while (true) {
+            try {
+                val outputIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
+                if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    synchronized(muxerLock) {
+                        val trackIndex = mediaMuxer!!.addTrack(encoder.outputFormat)
+                        if (isAudio) audioTrackIndex = trackIndex else videoTrackIndex = trackIndex
+                        val audioReady = !isAudioPermissionGranted || audioEncoder == null || audioTrackIndex != -1
+                        val videoReady = videoTrackIndex != -1
+                        if (audioReady && videoReady && muxerStarted.compareAndSet(false, true)) {
+                            mediaMuxer!!.start()
+                            muxerLock.notifyAll()
+                        }
+                    }
+                } else if (outputIndex >= 0) {
+                    val encodedData = encoder.getOutputBuffer(outputIndex)
+                    if (encodedData != null) {
+                        synchronized(muxerLock) {
+                            if (!muxerStarted.get()) {
+                                try {
+                                    muxerLock.wait(100)
+                                } catch (_: InterruptedException) {}
+                            }
+                        }
+                        if (muxerStarted.get() && bufferInfo.size > 0 && (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                            val trackIndex = if (isAudio) audioTrackIndex else videoTrackIndex
+                            mediaMuxer?.writeSampleData(trackIndex, encodedData, bufferInfo)
+                        }
+                        encoder.releaseOutputBuffer(outputIndex, false)
+                        if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                            break
+                        }
+                    }
+                } else if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    if (!isRecording) break
+                } else {
+                    break
+                }
+            } catch (e: Exception) {
+                break
+            }
+        }
+    }
+
+    // #################### 🔽 FIX: 안정적인 종료 로직으로 수정 🔽 ####################
+    private fun stopRecording() {
+        isRecording = false
+        Thread {
+            try {
+                // 오디오 인코더(Buffer 방식)에만 종료 신호 전송
+                audioEncoder?.signalEndOfInputStream()
+
+                // 데이터 처리 스레드들이 모두 종료될 때까지 대기
+                audioRecordThread?.join()
+                videoDrainThread?.join()
+                audioDrainThread?.join()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                // 모든 리소스 해제
+                releaseResources()
+            }
+        }.start()
+    }
+
+    private fun releaseResources() {
+        // 리소스 해제 순서가 중요함
+        try {
+            mediaProjection?.stop()
+        } catch (e: Exception) { e.printStackTrace() }
+        mediaProjection = null
+
+        try {
+            virtualDisplay?.release()
+        } catch (e: Exception) { e.printStackTrace() }
+        virtualDisplay = null
+
+        try {
+            videoEncoder?.stop(); videoEncoder?.release()
+        } catch (e: Exception) { e.printStackTrace() }
+        videoEncoder = null
+
+        try {
+            audioRecord?.stop(); audioRecord?.release()
+        } catch (e: Exception) { e.printStackTrace() }
+        audioRecord = null
+
+        try {
+            audioEncoder?.stop(); audioEncoder?.release()
+        } catch (e: Exception) { e.printStackTrace() }
+        audioEncoder = null
+
+        try {
+            if (muxerStarted.get()) mediaMuxer?.stop()
+            mediaMuxer?.release()
+        } catch (e: Exception) { e.printStackTrace() }
+        mediaMuxer = null
+
+        stopForeground(true)
+        stopSelf()
+    }
+    // ##########################################################################
+
+    private fun generateFilePath(fileName: String): String {
+        val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES)!!
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+        return File(dir, "${timestamp}_$fileName").absolutePath
+    }
+
+    private fun startForegroundWithNotification() {
+        createNotificationChannel()
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("화면 녹화 중")
-            .setContentText("앱이 화면을 녹화하고 있습니다.")
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentText("앱이 화면과 오디오를 녹화하고 있습니다.")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setOngoing(true)
             .build()
+        startForeground(NOTIFICATION_ID, notification)
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val serviceChannel = NotificationChannel(
-                CHANNEL_ID,
-                "Screen Record Channel",
-                NotificationManager.IMPORTANCE_DEFAULT
+                CHANNEL_ID, "Screen Record Channel", NotificationManager.IMPORTANCE_LOW
             )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(serviceChannel)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(serviceChannel)
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?) = null
 
     companion object {
-        private const val NOTIFICATION_ID = 1
+        const val ACTION_PREPARE = "ACTION_PREPARE"  // 추가된 상수
+        const val ACTION_START = "ACTION_START"
+        const val ACTION_STOP = "ACTION_STOP"
+        const val EXTRA_RESULT_CODE = "EXTRA_RESULT_CODE"
+        const val EXTRA_DATA = "EXTRA_DATA"
+        private const val NOTIFICATION_ID = 123
         private const val CHANNEL_ID = "ScreenRecordChannel"
     }
 }
